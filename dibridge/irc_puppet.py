@@ -6,11 +6,12 @@ import socket
 
 
 class IRCPuppet(irc.client_aio.AioSimpleIRCClient):
-    def __init__(self, irc_host, irc_port, ipv6_address, nickname, username, channel, remove_puppet_func, idle_timeout):
+    def __init__(self, irc_host, irc_port, ipv6_address, nickname, username, remove_puppet_func, idle_timeout):
         irc.client.SimpleIRCClient.__init__(self)
 
         self.loop = asyncio.get_event_loop()
 
+        self._client = None
         self._irc_host = irc_host
         self._irc_port = irc_port
         self._ipv6_address = ipv6_address
@@ -19,17 +20,21 @@ class IRCPuppet(irc.client_aio.AioSimpleIRCClient):
         self._nickname_iteration = 0
         self._username = username
         self._joined = False
-        self._channel = channel
+        self._channels = dict() 
         self._pinger_task = None
         self._remove_puppet_func = remove_puppet_func
         self._idle_timeout = idle_timeout
         self._idle_task = None
         self._reconnect = True
 
-        self._connected_event = asyncio.Event()
-        self._connected_event.clear()
-
         self._log = logging.getLogger(f"{__name__}.{self._nickname}")
+
+    def join_channel(self, ch):
+        if ch in self._channels:
+            return
+        self._channels[ch] = asyncio.Event()
+        if self._client and self.connection.is_connected():
+            self._client.join(ch)
 
     def on_nicknameinuse(self, client, event):
         # First iteration, try adding a [d] (Discord, get it?).
@@ -46,7 +51,8 @@ class IRCPuppet(irc.client_aio.AioSimpleIRCClient):
 
     def on_welcome(self, client, event):
         self._client = client
-        self._client.join(self._channel)
+        for c in self._channels:
+            self._client.join(c)
 
         if self._pinger_task:
             self._pinger_task.cancel()
@@ -59,23 +65,23 @@ class IRCPuppet(irc.client_aio.AioSimpleIRCClient):
     # on_pubmsg is done by the IRCRelay, and not by the puppets.
 
     def on_join(self, _client, event):
-        if event.target != self._channel:
+        if event.target not in self._channels:
             return
 
         if event.source.nick == self._nickname:
-            self._log.info("Joined %s on IRC", self._channel)
+            self._log.info("Joined %s on IRC", event.target)
+            self._channels[event.target].set()
             self._joined = True
-            self._connected_event.set()
 
     def on_part(self, _client, event):
-        if event.target != self._channel:
+        if event.target not in self._channels:
             return
-        self._left(event.source.nick)
+        self._left(event.source.nick, event.target)
 
     def on_kick(self, _client, event):
-        if event.target != self._channel:
+        if event.target not in self._channels:
             return
-        self._left(event.arguments[0])
+        self._left(event.arguments[0], event.target)
 
     def on_kill(self, _client, event):
         # If a user is killed, the ops on IRC must have a good reason.
@@ -97,7 +103,8 @@ class IRCPuppet(irc.client_aio.AioSimpleIRCClient):
     def on_disconnect(self, _client, event):
         self._log.warning("Disconnected from IRC")
         self._joined = False
-        self._connected_event.clear()
+        for c in self._channels:
+            self._channels[c].clear()
         if self._pinger_task:
             self._pinger_task.cancel()
 
@@ -105,13 +112,13 @@ class IRCPuppet(irc.client_aio.AioSimpleIRCClient):
             # Start a task to reconnect us.
             asyncio.create_task(self.connect())
 
-    def _left(self, nick):
-        # If we left the channel, rejoin.
-        if nick == self._nickname:
-            self._joined = False
-            self._connected_event.clear()
-            self._client.join(self._channel)
+    def _left(self, nick, ch):
+        # If we left a channel, rejoin.
+        if nick != self._nickname:
             return
+
+        self._channels[ch].clear()
+        self._client.join(ch)
 
     async def _pinger(self):
         while True:
@@ -210,14 +217,14 @@ class IRCPuppet(irc.client_aio.AioSimpleIRCClient):
     def is_offline(self):
         return self._idle_task is not None
 
-    async def send_message(self, content):
+    async def send_message(self, content, ch):
         await self._reset_idle_timeout()
 
-        await self._connected_event.wait()
-        self._client.privmsg(self._channel, content)
+        await self._channels[ch].wait()
+        self._client.privmsg(ch, content)
 
-    async def send_action(self, content):
+    async def send_action(self, content, ch):
         await self._reset_idle_timeout()
 
-        await self._connected_event.wait()
-        self._client.action(self._channel, content)
+        await self._channels[ch].wait()
+        self._client.action(ch, content)

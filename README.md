@@ -10,9 +10,6 @@ Bridge the two!
 
 This server logs in to both IRC and Discord, and forward messages between the two.
 
-This server is very limited, as in: it only bridges a single Discord channel with a single IRC channel.
-If you want to bridge multiple, you will have to run more than one server.
-
 ## TODO-list
 
 This software is currently in pre-alpha.
@@ -43,7 +40,6 @@ This with the goal that the IRC population doesn't think strange about this, and
 There are however some limitations:
 - Edits on Discord are not send to IRC.
 - Reactions on Discord are not send to IRC.
-- This bridges a single Discord channel to a single IRC channel, and no more.
 - On IRC you do not see who is online on Discord unless they said something.
 - On Discord you do not see who is online on IRC unless they said something.
 
@@ -56,19 +52,22 @@ Options:
   --sentry-dsn TEXT             Sentry DSN.
   --sentry-environment TEXT     Environment we are running in.
   --discord-token TEXT          Discord bot token to authenticate.  [required]
-  --discord-channel-id INTEGER  Discord channel ID to relay to.  [required]
+  --discord-channel-id INTEGER  Discord channel ID to relay to.
   --irc-host TEXT               IRC host to connect to.  [required]
   --irc-port INTEGER            IRC SSL port to connect to.
   --irc-nick TEXT               IRC nick to use.  [required]
-  --irc-channel TEXT            IRC channel to relay to, without the first
-                                '#'.  [required]
+  --irc-channel TEXT            IRC channel to relay to, as
+                                'discord_id=irc_channel,...', without the
+                                first '#' on IRC.
+  --channel-map TEXT            Discord->IRC channel lists to relay, without
+                                the first '#'.
   --irc-puppet-ip-range TEXT    An IPv6 CIDR range to use for IRC puppets.
                                 (2001:A:B:C:D::/80)
   --irc-puppet-postfix TEXT     Postfix to add to IRC puppet nicknames
                                 (default: none).
   --irc-ignore-list TEXT        IRC nicknames to not relay messages for (comma
                                 separated, case-insensitive).
-  --irc-idle_timeout INTEGER    IRC puppet idle timeout, in seconds (default:
+  --irc-idle-timeout INTEGER    IRC puppet idle timeout, in seconds (default:
                                 2 days).
   -h, --help                    Show this message and exit.
 ```
@@ -93,9 +92,9 @@ Additionally, the bot uses the following intents:
 Some of these intents need additional permission on the bot's side, under `Privileged Gateway Intents`.
 Without those, this application will fail to start.
 
-After creating a bot, you need to invite this bot to your Discord channel.
+After creating a bot, you need to invite this bot to your Discord channels.
 If you are not the owner of that channel, you would need to make the bot `Public` before the admin can add it.
-The bot needs at least `Send Messages`, `Read Messages` and `Manage Webhooks` permissions on the Discord server channel.
+The bot needs at least `Send Messages`, `Read Messages` and `Manage Webhooks` permissions on the Discord server channels.
 These permissions need to be assigned on the Discord server itself, by someone with sufficient permissions to do so.
 
 ### IRC Puppet IP Range

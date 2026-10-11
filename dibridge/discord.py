@@ -15,7 +15,7 @@ IRC_MAX_LINE_LENGTH = 400
 
 
 class RelayDiscord(discord.Client):
-    def __init__(self, channel_id):
+    def __init__(self, channels):
         # We need many intents:
         # - messages, to receive messages.
         # - guilds, to get the channel.
@@ -29,7 +29,8 @@ class RelayDiscord(discord.Client):
         super().__init__(intents=intents, allowed_mentions=allowed_mentions)
 
         self._status = None
-        self._channel_id = channel_id
+        self._channel_ids = channels
+        self._webhooks = dict()
         self._commands = discord.app_commands.CommandTree(self)
 
         # Rebind the commands to the current client.
@@ -44,21 +45,24 @@ class RelayDiscord(discord.Client):
 
     async def on_ready(self):
         # Check if we have access to the channel.
-        self._channel = self.get_channel(self._channel_id)
-        if not self._channel:
-            log.error("Discord channel ID %s not found", self._channel_id)
+        self._channels = {cid: self.get_channel(cid) for cid in self._channel_ids}
+        not_found = [ch for ch in self._channel_ids if self._channels[ch] is None]
+        if len(not_found) != 0:
+            log.error(f"Discord channel ID {not_found} not found")
             relay.IRC.stop()
             sys.exit(1)
 
-        # Make sure there is a webhook on the channel to use for relaying.
-        for webhook in await self._channel.webhooks():
-            if webhook.token is not None:
-                self._channel_webhook = webhook
-                break
-        else:
-            self._channel_webhook = await self._channel.create_webhook(
-                name="ircbridge", reason="To bridge IRC messages to Discord"
-            )
+        for channel_id in self._channel_ids:
+            channel = self._channels[channel_id]
+            # Make sure there is a webhook on the channel to use for relaying.
+            for webhook in await channel.webhooks():
+                if webhook.token is not None:
+                    self._webhooks[channel_id] = webhook
+                    break
+            else:
+                self._webhooks[channel_id] = await channel.create_webhook(
+                    name="ircbridge", reason="To bridge IRC messages to Discord"
+                )
 
         if self._status:
             await self._update_presence(self._status)
@@ -67,7 +71,7 @@ class RelayDiscord(discord.Client):
 
     async def on_message(self, message):
         # Only monitor the indicated channel.
-        if message.channel.id != self._channel_id:
+        if message.channel.id not in self._channel_ids:
             return
         # We don't care what bots have to say.
         if message.author.bot:
@@ -120,9 +124,10 @@ class RelayDiscord(discord.Client):
         for emoji in find_emojis(content):
             content = replace_mention("<:", ">", f"{emoji['name']}:{emoji['id']}", f":{emoji['name']}:", content)
 
+        irc_channel = self._channel_ids[message.channel.id]
         # First, send any attachment as links.
         for attachment in message.attachments:
-            relay.IRC.send_message(message.author.id, message.author.name, attachment.url)
+            relay.IRC.send_message(message.author.id, message.author.name, attachment.url, irc_channel)
 
         content = content.replace("\r\n", "\n").replace("\r", "\n").strip()
 
@@ -135,7 +140,7 @@ class RelayDiscord(discord.Client):
             and "\n" not in content
             and len(content) < IRC_MAX_LINE_LENGTH
         ):
-            relay.IRC.send_action(message.author.id, message.author.name, content[1:-1])
+            relay.IRC.send_action(message.author.id, message.author.name, content[1:-1], irc_channel)
         else:
             for full_line in content.split("\n"):
                 # On Discord, you make code-blocks by starting and finishing with ```.
@@ -145,7 +150,7 @@ class RelayDiscord(discord.Client):
 
                 # Split the message in lines of at most IRC_MAX_LINE_LENGTH characters, breaking on words.
                 for line in textwrap.wrap(full_line.strip(), IRC_MAX_LINE_LENGTH):
-                    relay.IRC.send_message(message.author.id, message.author.name, line)
+                    relay.IRC.send_message(message.author.id, message.author.name, line, irc_channel)
 
     async def on_presence_update(self, before, after):
         relay.IRC.update_status(after.id, after.status == discord.Status.offline)
@@ -155,21 +160,22 @@ class RelayDiscord(discord.Client):
 
     @discord.app_commands.command(name="status", description="Get the status of the bridge")
     async def command_status(self, interaction: discord.Interaction):
-        status = f":green_circle: **Discord** listening in <#{self._channel_id}>\n"
+        channels = ', '.join(f'<#{ch}>' for ch in self._channel_ids)
+        status = f":green_circle: **Discord** listening in {channels}\n"
         status += relay.IRC.get_status()
 
         await interaction.response.send_message(status, ephemeral=True)
 
-    async def _send_message(self, irc_username, message):
-        await self._channel_webhook.send(
+    async def _send_message(self, irc_username, message, channel):
+        await self._webhooks[channel].send(
             message,
             username=irc_username,
             suppress_embeds=True,
             avatar_url=f"https://robohash.org/${irc_username}.png?set=set4",
         )
 
-    async def _send_message_self(self, message):
-        await self._channel.send(message)
+    async def _send_message_self(self, message, channel):
+        await self._channels[channel].send(message)
 
     async def _update_presence(self, status):
         self._status = status
@@ -183,19 +189,19 @@ class RelayDiscord(discord.Client):
 
     # Thread safe wrapper around functions
 
-    def send_message(self, irc_username, message):
+    def send_message(self, irc_username, message, channel):
         if self.loop == discord.utils.MISSING:
             log.warning(f"Can't relay message from {irc_username} to Discord: connection is down.")
             return
 
-        asyncio.run_coroutine_threadsafe(self._send_message(irc_username, message), self.loop)
+        asyncio.run_coroutine_threadsafe(self._send_message(irc_username, message, channel), self.loop)
 
-    def send_message_self(self, message):
+    def send_message_self(self, message, channel):
         if self.loop == discord.utils.MISSING:
             log.warning("Can't relay status message to Discord: connection is down.")
             return
 
-        asyncio.run_coroutine_threadsafe(self._send_message_self(message), self.loop)
+        asyncio.run_coroutine_threadsafe(self._send_message_self(message, channel), self.loop)
 
     def update_presence(self, status):
         if self.loop == discord.utils.MISSING:

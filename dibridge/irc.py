@@ -29,7 +29,7 @@ REGEX_USERNAME_START_FILTER = r"^[_\[\]\{\}\|]+"
 
 
 class IRCRelay(irc.client_aio.AioSimpleIRCClient):
-    def __init__(self, host, port, nickname, channel, puppet_ip_range, puppet_postfix, ignore_list, idle_timeout):
+    def __init__(self, host, port, nickname, channels, puppet_ip_range, puppet_postfix, ignore_list, idle_timeout):
         irc.client.SimpleIRCClient.__init__(self)
 
         self._loop = asyncio.get_event_loop()
@@ -39,9 +39,9 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
         self._nickname = nickname
         self._nickname_original = nickname
         self._nickname_iteration = 0
-        self._joined = False
-        self._tell_once = True
-        self._channel = channel
+        self._joined = set()
+        self._warned = set()
+        self._channels = channels
         self._puppet_ip_range = puppet_ip_range
         self._puppet_postfix = puppet_postfix
         self._pinger_task = None
@@ -61,7 +61,8 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
 
     def on_welcome(self, client, event):
         self._client = client
-        self._client.join(self._channel)
+        for channel in self._channels:
+            self._client.join(channel)
 
         if self._pinger_task:
             self._pinger_task.cancel()
@@ -72,63 +73,70 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
         pass
 
     def on_pubmsg(self, _, event):
-        if event.target != self._channel:
+        if event.target not in self._channels:
             return
         if event.source.nick.lower() in self._ignore_list:
             return
-        asyncio.create_task(self._relay_mesage(event.source.nick, event.arguments[0]))
+        asyncio.create_task(self._relay_mesage(event.source.nick, event.arguments[0], event.target))
 
     def on_action(self, _, event):
-        if event.target != self._channel:
+        if event.target not in self._channels:
             return
-        asyncio.create_task(self._relay_mesage(event.source.nick, f"_{event.arguments[0]}_"))
+        asyncio.create_task(self._relay_mesage(event.source.nick, f"_{event.arguments[0]}_", event.target))
 
     def on_join(self, _client, event):
-        if event.target != self._channel:
+        channel = event.target
+        if channel not in self._channels:
             return
 
         if event.source.nick == self._nickname:
-            if not self._tell_once:
-                relay.DISCORD.send_message_self(":white_check_mark: IRC bridge is now active :white_check_mark: ")
-            log.info("Joined %s on IRC", self._channel)
-            self._joined = True
-            self._tell_once = True
+            if channel in self._warned:
+                dchannel = self._channels[channel]
+                relay.DISCORD.send_message_self(":white_check_mark: IRC bridge is now active :white_check_mark: ", dchannel)
+                self._warned.remove(channel)
+            log.info("Joined %s on IRC", channel)
+            self._joined.add(channel)
 
-            relay.DISCORD.update_presence(f"{self._channel} on IRC")
+            channels = ', '.join(self._joined)
+            relay.DISCORD.update_presence(f"{channels} on IRC")
 
     def on_part(self, _client, event):
-        if event.target != self._channel:
+        if event.target not in self._channels:
             return
-        self._left(event.source.nick)
+        self._left(event.source.nick, event.target)
 
     def on_kick(self, _client, event):
-        if event.target != self._channel:
+        if event.target not in self._channels:
             return
-        self._left(event.arguments[0])
+        self._left(event.arguments[0], event.target)
 
     def on_quit(self, _client, event):
-        self._left(event.source.nick)
+        for channel in list(self._users_spoken.get(event.source.nick, {})):
+            self._left(event.source.nick, channel)
 
     def on_disconnect(self, _client, event):
         log.error("Disconnected from IRC")
-        self._joined = False
+        self._joined.clear()
         if self._pinger_task:
             self._pinger_task.cancel()
 
         # Start a task to reconnect us.
         asyncio.create_task(self._connect())
 
-    def _left(self, nick):
+    def _left(self, nick, channel):
         # If we left the channel, rejoin.
         if nick == self._nickname:
-            self._joined = False
-            self._client.join(self._channel)
+            self._joined.discard(channel)
+            self._client.join(channel)
             return
 
         # If the user spoken recently, show on Discord the user left.
-        if self._users_spoken.get(nick, 0) > time.time() - LEFT_WHILE_TALKING_TIMEOUT:
-            self._users_spoken.pop(nick)
-            relay.DISCORD.send_message(nick, "_left the IRC channel_")
+        user_spoken = self._users_spoken.get(nick, {})
+        if user_spoken.pop(channel, 0) > time.time() - LEFT_WHILE_TALKING_TIMEOUT:
+            discord_channel = self._channels[channel]
+            relay.DISCORD.send_message(nick, "_left the IRC channel_", discord_channel)
+        if not user_spoken:
+            self._users_spoken.pop(nick, None)
 
     async def _pinger(self):
         while True:
@@ -154,22 +162,7 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
                 # When we can't connect, try again in 5 seconds.
                 await asyncio.sleep(5)
 
-    async def _send_message(self, discord_id, discord_username, message, is_action=False):
-        # If we aren't connected to IRC yet, tell this to the Discord users; but only once.
-        if not self._joined:
-            if self._tell_once:
-                self._tell_once = False
-                relay.DISCORD.send_message_self(
-                    ":warning: IRC bridge isn't active; messages will not be delivered :warning:"
-                )
-            return
-
-        if not self._puppet_ip_range:
-            if is_action:
-                message = f"/me {message}"
-            self._client.privmsg(self._channel, f"<{discord_username}>: {message}")
-            return
-
+    async def _ensure_puppet_channel(self, discord_id, discord_username, channel):
         if discord_id not in self._puppets:
             sanitized_discord_username = self._sanitize_discord_username(discord_username)
             ipv6_address = self._puppet_ip_range[self._generate_ipv6_bits(sanitized_discord_username)]
@@ -183,18 +176,39 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
                 ipv6_address,
                 irc_nickname,
                 irc_username,
-                self._channel,
                 functools.partial(self._remove_puppet, discord_id),
                 self._idle_timeout,
             )
             asyncio.create_task(self._puppets[discord_id].connect())
+        self._puppets[discord_id].join_channel(channel)
+
+    async def _send_message(self, discord_id, discord_username, message, channel, is_action=False):
+        # If we aren't connected to IRC yet, tell this to the Discord users; but only once.
+        if channel not in self._joined:
+            if channel not in self._warned:
+                self._warned.add(channel)
+                dchannel = self._channels[channel]
+                relay.DISCORD.send_message_self(
+                    ":warning: IRC bridge isn't active; messages will not be delivered :warning:", dchannel
+                )
+            return
+
+        if not self._puppet_ip_range:
+            if is_action:
+                message = f"/me {message}"
+            self._client.privmsg(channel, f"<{discord_username}>: {message}")
+            return
+
+        await self._ensure_puppet_channel(discord_id, discord_username, channel)
 
         if is_action:
-            await self._puppets[discord_id].send_action(message)
+            await self._puppets[discord_id].send_action(message, channel)
         else:
-            await self._puppets[discord_id].send_message(message)
+            await self._puppets[discord_id].send_message(message, channel)
 
-    async def _relay_mesage(self, irc_username, message):
+    async def _relay_mesage(self, irc_username, message, channel_irc):
+        channel = self._channels[channel_irc]
+
         for discord_id, puppet in self._puppets.items():
             # Don't echo back talk done by our puppets.
             if puppet._nickname == irc_username:
@@ -216,8 +230,8 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
             if message.startswith(f"<@{discord_id}>: "):
                 message = f"<@{discord_id}> " + message[len(f"<@{discord_id}>: ") :]
 
-        self._users_spoken[irc_username] = time.time()
-        relay.DISCORD.send_message(irc_username, message)
+        self._users_spoken.setdefault(irc_username, {})[channel_irc] = time.time()
+        relay.DISCORD.send_message(irc_username, message, channel)
 
     def _sanitize_discord_username(self, discord_username):
         original_discord_username = discord_username
@@ -262,8 +276,9 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
     # Thread safe wrapper around functions
 
     def get_status(self):
-        if self._joined:
-            status = f":green_circle: **IRC** listening on `{self._host}` in `{self._channel}`\n"
+        if len(self._joined) > 0:
+            channels = ", ".join(self._joined)
+            status = f":green_circle: **IRC** listening on `{self._host}` in `{channels}`\n"
         else:
             status = ":red_circle: **IRC** not connected\n"
         if self._puppets:
@@ -292,12 +307,12 @@ class IRCRelay(irc.client_aio.AioSimpleIRCClient):
             # Stop the timer if the user comes back.
             asyncio.run_coroutine_threadsafe(self._puppets[discord_id].stop_idle_timeout(), self._loop)
 
-    def send_message(self, discord_id, discord_username, message):
-        asyncio.run_coroutine_threadsafe(self._send_message(discord_id, discord_username, message), self._loop)
+    def send_message(self, discord_id, discord_username, message, channel):
+        asyncio.run_coroutine_threadsafe(self._send_message(discord_id, discord_username, message, channel), self._loop)
 
-    def send_action(self, discord_id, discord_username, message):
+    def send_action(self, discord_id, discord_username, message, channel):
         asyncio.run_coroutine_threadsafe(
-            self._send_message(discord_id, discord_username, message, is_action=True), self._loop
+            self._send_message(discord_id, discord_username, message, channel, is_action=True), self._loop
         )
 
     def stop(self):
